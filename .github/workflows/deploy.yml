@@ -39,6 +39,9 @@ jobs:
         run: touch dist/.nojekyll
 
       - uses: actions/configure-pages@v5
+        with:
+          # turns Pages on for the repo if it isn't already (needs pages: write above)
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
