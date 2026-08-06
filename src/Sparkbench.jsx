@@ -52,27 +52,48 @@ const store = {
 };
 
 /* --- buzzer audio: Web Audio, created lazily on the first user gesture --- */
-const audio = { ctx: null, nodes: {}, muted: false };
+/* iOS mutes Web Audio when the ringer switch is off unless the page owns a
+   "playback" audio session — hence the audioSession hint plus a silent looping
+   element, which is the pre-16.4 way of achieving the same thing. */
+const SILENT_WAV = 'data:audio/wav;base64,UklGRrQBAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YZABAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICA';
+const audio = { ctx: null, nodes: {}, muted: false, el: null, ready: false, onState: null };
+function markAudio() {
+  const r = !!(audio.ctx && audio.ctx.state === 'running');
+  if (r !== audio.ready) { audio.ready = r; if (audio.onState) audio.onState(r); }
+}
 function ensureAudio() {
   try {
+    // tell iOS this page plays audio, so the ringer switch doesn't silence it
+    if (typeof navigator !== 'undefined' && navigator.audioSession) {
+      try { navigator.audioSession.type = 'playback'; } catch (e) { /* older Safari */ }
+    }
+    if (!audio.el) {
+      const el = new Audio(SILENT_WAV);
+      el.loop = true; el.volume = 0.001;
+      el.setAttribute('playsinline', ''); el.setAttribute('webkit-playsinline', '');
+      audio.el = el;
+    }
+    const p = audio.el.play(); if (p && p.catch) p.catch(() => {});
     if (!audio.ctx) {
       const AC = window.AudioContext || window.webkitAudioContext;
       if (AC) audio.ctx = new AC();
     }
-    if (audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume().catch(() => {});
+    if (audio.ctx && audio.ctx.state !== 'running') audio.ctx.resume().then(markAudio).catch(() => {});
+    markAudio();
   } catch (e) { /* no sound available */ }
 }
 function setBuzzerLevel(id, level) {
   const ctx = audio.ctx; if (!ctx) return;
   let n = audio.nodes[id];
-  const target = audio.muted ? 0 : Math.min(0.16, level * 0.16);
+  const target = audio.muted ? 0 : Math.min(0.3, level * 0.3);
   if (target > 0.002 && !n) {
-    const osc = ctx.createOscillator(); osc.type = 'square'; osc.frequency.value = 1760;
+    const osc = ctx.createOscillator(); osc.type = 'square'; osc.frequency.value = 2100;
+    const tone = ctx.createBiquadFilter(); tone.type = 'lowpass'; tone.frequency.value = 5200;
     const g = ctx.createGain(); g.gain.value = 0;
-    osc.connect(g); g.connect(ctx.destination); osc.start();
+    osc.connect(tone); tone.connect(g); g.connect(ctx.destination); osc.start();
     n = audio.nodes[id] = { osc, g };
   }
-  if (n) n.g.gain.setTargetAtTime(target, ctx.currentTime, 0.04);
+  if (n) n.g.gain.setTargetAtTime(target, ctx.currentTime, 0.03);
 }
 function stopBuzzer(id) {
   const n = audio.nodes[id];
@@ -671,7 +692,7 @@ function seriesLoop(comps, wires) {
 
 /* Deterministic diagnostics: every finding comes with its evidence, and clicking
    one selects the culprit on the board. */
-function diagnose(comps, wires, res, dev, running) {
+function diagnose(comps, wires, res, dev, running, audioOn) {
   const out = [];
   const push = (level, text, evidence, compId) => out.push({ level, text, evidence, compId });
   if (!running) { push('info', 'Simulation stopped', 'press ▶ Run to power the circuit'); return out; }
@@ -717,6 +738,10 @@ function diagnose(comps, wires, res, dev, running) {
     else if (!hasRevLed && loose.length) push('warn', 'The loop is not complete', loose.length + ' terminal' + (loose.length > 1 ? 's' : '') + ' (hollow dots) still need wiring', loose[0].id);
     else if (!out.length) push('warn', 'No current is flowing', 'check the loop runs from + through every part and back to −');
   }
+  const buzzing = comps.some((c) => c.type === 'buzzer' && res && res.comp[c.id] && res.comp[c.id].sounding && res.comp[c.id].I > 5e-4);
+  if (buzzing && !audioOn) {
+    push('info', 'Buzzer is sounding but you may not hear it', 'tap the board once to let the page play audio — and on iPhone check the side silent switch, since it mutes web audio');
+  }
   if (!out.length) push('ok', 'Circuit looks healthy', 'complete loop · sensible values · nothing overheating');
   return out;
 }
@@ -738,6 +763,7 @@ export default function Sparkbench() {
   const [narrow, setNarrow] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(true);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [audioReady, setAudioReady] = useState(false);
   const [, setTick] = useState(0);
 
   const svgRef = useRef(null);
@@ -757,6 +783,15 @@ export default function Sparkbench() {
   const histRef = useRef([]);
   const boxARRef = useRef(H / W); boxARRef.current = boxAR;
   const narrowRef = useRef(false); narrowRef.current = narrow;
+  const viewRef = useRef(view); viewRef.current = view;
+  const ptrsRef = useRef(new Map());
+  const pinchRef = useRef(null);
+
+  useEffect(() => {
+    audio.onState = setAudioReady;
+    setAudioReady(audio.ready);
+    return () => { audio.onState = null; };
+  }, []);
 
   /* --- load / save --- */
   const loadPreset = (i) => {
@@ -874,6 +909,56 @@ export default function Sparkbench() {
     check();
     window.addEventListener('resize', check);
     return () => window.removeEventListener('resize', check);
+  }, []);
+
+  /* --- pinch to zoom (capture phase, so it works over components too) --- */
+  useEffect(() => {
+    const el = svgRef.current; if (!el) return;
+    const pt = (e) => ({ x: e.clientX, y: e.clientY });
+    const down = (e) => {
+      ptrsRef.current.set(e.pointerId, pt(e));
+      if (ptrsRef.current.size === 2) {
+        const [a, b] = Array.from(ptrsRef.current.values());
+        dragRef.current = null; panRef.current = null;   // a pinch is not a drag
+        setWiring(null); setPlacing(null);
+        pinchRef.current = {
+          d0: Math.hypot(a.x - b.x, a.y - b.y),
+          mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+          v0: viewRef.current,
+          rect: el.getBoundingClientRect(),
+        };
+      }
+    };
+    const move = (e) => {
+      if (!ptrsRef.current.has(e.pointerId)) return;
+      ptrsRef.current.set(e.pointerId, pt(e));
+      const p = pinchRef.current;
+      if (!p || ptrsRef.current.size < 2) return;
+      const [a, b] = Array.from(ptrsRef.current.values());
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      if (d < 8 || p.d0 < 8) return;
+      const ar = boxARRef.current;
+      const w = Math.min(2400, Math.max(320, (p.v0.w * p.d0) / d));
+      const kx = (p.mid.x - p.rect.left) / p.rect.width;
+      const ky = (p.mid.y - p.rect.top) / p.rect.height;
+      const px = p.v0.x + kx * p.v0.w, py = p.v0.y + ky * (p.v0.w * ar);
+      setView({ x: px - kx * w, y: py - ky * (w * ar), w });
+      e.preventDefault();
+    };
+    const up = (e) => {
+      ptrsRef.current.delete(e.pointerId);
+      if (ptrsRef.current.size < 2) pinchRef.current = null;
+    };
+    el.addEventListener('pointerdown', down, true);
+    el.addEventListener('pointermove', move, true);
+    el.addEventListener('pointerup', up, true);
+    el.addEventListener('pointercancel', up, true);
+    return () => {
+      el.removeEventListener('pointerdown', down, true);
+      el.removeEventListener('pointermove', move, true);
+      el.removeEventListener('pointerup', up, true);
+      el.removeEventListener('pointercancel', up, true);
+    };
   }, []);
 
   /* --- helpers --- */
@@ -1026,6 +1111,7 @@ export default function Sparkbench() {
     setWiring(null);
   };
   const onMove = (e) => {
+    if (pinchRef.current) return;
     const p = svgPt(e); ptrRef.current = p;
     const pn = panRef.current;
     if (pn) {
@@ -1048,6 +1134,7 @@ export default function Sparkbench() {
     }
   };
   const onUp = () => {
+    if (pinchRef.current || ptrsRef.current.size > 1) { dragRef.current = null; panRef.current = null; return; }
     const pn = panRef.current;
     if (pn) { panRef.current = null; if (!pn.moved) setSel(null); return; }
     const dr = dragRef.current;
@@ -1087,7 +1174,7 @@ export default function Sparkbench() {
     : null;
 
   const loop = running && res ? seriesLoop(comps, wires) : null;
-  const diags = diagnose(comps, wires, res, devRef.current, running);
+  const diags = diagnose(comps, wires, res, devRef.current, running, audioReady);
 
   /* --- styles --- */
   const chip = (active, extra) => ({
@@ -1110,7 +1197,17 @@ export default function Sparkbench() {
   };
 
   return (
-    <div style={{ height: narrow ? '100dvh' : 'auto', minHeight: narrow ? undefined : '100vh', background: PAPER, color: INK, fontFamily: MONO, padding: narrow ? 0 : '14px 12px 20px', boxSizing: 'border-box', userSelect: 'none', WebkitUserSelect: 'none', display: 'flex', flexDirection: 'column', overflow: narrow ? 'hidden' : 'visible' }}>
+    <div style={{
+      position: narrow ? 'fixed' : 'relative', inset: narrow ? 0 : undefined,
+      minHeight: narrow ? undefined : '100vh',
+      background: PAPER, color: INK, fontFamily: MONO,
+      paddingTop: narrow ? 'env(safe-area-inset-top)' : 14,
+      paddingBottom: narrow ? 'env(safe-area-inset-bottom)' : 20,
+      paddingLeft: narrow ? 'env(safe-area-inset-left)' : 12,
+      paddingRight: narrow ? 'env(safe-area-inset-right)' : 12,
+      boxSizing: 'border-box', userSelect: 'none', WebkitUserSelect: 'none',
+      display: 'flex', flexDirection: 'column', overflow: 'hidden',
+    }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@400;500;700&display=swap');
         .sb-pulse { animation: sbp 1s ease-in-out infinite; }
@@ -1142,7 +1239,7 @@ export default function Sparkbench() {
             <div style={{ display: 'flex', gap: 5, alignItems: 'center' }}>
               <button title={running ? 'Stop' : 'Run'} style={chip(!running, { fontWeight: 700, padding: '5px 9px' })} onClick={() => setRunning((r) => !r)}>{running ? '⏸' : '▶'}</button>
               <button title="Undo" disabled={!histLen} style={chip(false, { padding: '5px 9px', opacity: histLen ? 1 : 0.35 })} onClick={undo}>↩</button>
-              <button title={muted ? 'Unmute' : 'Mute'} style={chip(false, { padding: '5px 9px' })} onClick={() => { audio.muted = !audio.muted; setMuted(audio.muted); }}>{muted ? '🔇' : '🔊'}</button>
+              <button title={muted ? 'Unmute' : 'Mute'} style={chip(false, { padding: '5px 9px' })} onClick={() => { ensureAudio(); audio.muted = !audio.muted; setMuted(audio.muted); }}>{muted ? '🔇' : audioReady ? '🔊' : '🔈'}</button>
               <button title="Examples" style={chip(menuOpen, { padding: '5px 9px' })} onClick={() => setMenuOpen((m) => !m)}>⋯</button>
             </div>
           )}
@@ -1283,7 +1380,7 @@ export default function Sparkbench() {
               <div style={overlayBar}>
                 <button title={running ? 'Stop the simulation' : 'Run the simulation'} style={chip(!running, { fontWeight: 700, padding: '5px 10px', border: 'none', background: running ? 'transparent' : '#fdf3df' })} onClick={() => setRunning((r) => !r)}>{running ? '⏸ Stop' : '▶ Run'}</button>
                 <button title="Undo (Ctrl+Z)" disabled={!histLen} style={chip(false, { padding: '5px 10px', border: 'none', background: 'transparent', opacity: histLen ? 1 : 0.35 })} onClick={undo}>↩ Undo</button>
-                <button title={muted ? 'Unmute buzzers' : 'Mute buzzers'} style={chip(false, { padding: '5px 9px', border: 'none', background: 'transparent' })} onClick={() => { audio.muted = !audio.muted; setMuted(audio.muted); }}>{muted ? '🔇' : '🔊'}</button>
+                <button title={muted ? 'Unmute buzzers' : audioReady ? 'Mute buzzers' : 'Tap to enable sound'} style={chip(false, { padding: '5px 9px', border: 'none', background: 'transparent' })} onClick={() => { ensureAudio(); audio.muted = !audio.muted; setMuted(audio.muted); }}>{muted ? '🔇' : audioReady ? '🔊' : '🔈'}</button>
               </div>
             )}
             {anyLdr && (
@@ -1331,6 +1428,7 @@ export default function Sparkbench() {
           borderRadius: narrow ? '14px 14px 0 0' : 14, padding: narrow ? '0 12px 10px' : '12px 14px', fontSize: 12.5,
           boxShadow: narrow ? '0 -3px 14px rgba(60,50,20,0.08)' : '0 2px 10px rgba(60,50,20,0.06)',
           maxHeight: narrow ? (sheetOpen ? '46dvh' : 46) : undefined, overflowY: 'auto', overflowX: 'hidden',
+          overscrollBehavior: 'contain', WebkitOverflowScrolling: 'touch',
         }}>
           {narrow && (
             <div onClick={() => setSheetOpen((s) => !s)}
