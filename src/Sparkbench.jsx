@@ -133,6 +133,51 @@ function midAxis(p, q) {
   if (p.x === q.x) return 'x';
   return Math.abs(q.x - p.x) >= Math.abs(q.y - p.y) ? 'x' : 'y';
 }
+
+/* --- body-avoiding routing ---
+   An L-shaped wire can elbow two ways. If one way ploughs through a component
+   body (classically: a wire leaving the cathode and doubling back under the
+   LED, which makes current look like it flows backwards), pick the other. */
+function compBBox(c) {
+  const ts = getTerminals(c);
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  ts.forEach((p) => { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); });
+  return { x0: x0 - 18, y0: y0 - 18, x1: x1 + 18, y1: y1 + 18 };
+}
+function segRectOverlap(A, B, r) {
+  if (A.x === B.x) {
+    if (A.x < r.x0 || A.x > r.x1) return 0;
+    const lo = Math.max(Math.min(A.y, B.y), r.y0), hi = Math.min(Math.max(A.y, B.y), r.y1);
+    return Math.max(0, hi - lo);
+  }
+  if (A.y === B.y) {
+    if (A.y < r.y0 || A.y > r.y1) return 0;
+    const lo = Math.max(Math.min(A.x, B.x), r.x0), hi = Math.min(Math.max(A.x, B.x), r.x1);
+    return Math.max(0, hi - lo);
+  }
+  return 0;
+}
+function routeScore(pts, comps) {
+  let s = 0;
+  comps.forEach((c) => {
+    const r = compBBox(c);
+    for (let i = 0; i < pts.length - 1; i++) {
+      if (segRectOverlap(pts[i], pts[i + 1], r) > 26) { s++; break; }
+    }
+  });
+  return s;
+}
+/* the one true route for a wire — used by the renderer, hit tests and splicing */
+function wireRoute(w, comps) {
+  const p = termOfIn(comps, w.a), q = termOfIn(comps, w.b);
+  if (!p || !q) return null;
+  if (w.mid && typeof w.mid.v === 'number') return pathPoints(p, q, w.vfirst, w.mid);
+  if (p.x === q.x || p.y === q.y) return [p, q];
+  const hp = pathPoints(p, q, false), vp = pathPoints(p, q, true);
+  const hs = routeScore(hp, comps), vs = routeScore(vp, comps);
+  if (hs !== vs) return hs < vs ? hp : vp;
+  return w.vfirst ? vp : hp;
+}
 function onSeg(P, A, B) {
   if (A.x === B.x) return P.x === A.x && P.y >= Math.min(A.y, B.y) && P.y <= Math.max(A.y, B.y);
   if (A.y === B.y) return P.y === A.y && P.x >= Math.min(A.x, B.x) && P.x <= Math.max(A.x, B.x);
@@ -180,9 +225,9 @@ function autoConnect(c, comps, wires, seqRef) {
   const hits = [];
   ws.forEach((w, wi) => {
     if (w.a.comp === c.id || w.b.comp === c.id) return;
-    const p = termOfIn(comps, w.a), q = termOfIn(comps, w.b);
-    if (!p || !q) return;
-    const pts = pathPoints(p, q, w.vfirst, w.mid);
+    const pts = wireRoute(w, comps);
+    if (!pts) return;
+    const p = pts[0], q = pts[pts.length - 1];
     terms.forEach((P, ti) => {
       if ((P.x === p.x && P.y === p.y) || (P.x === q.x && P.y === q.y)) return;
       for (let s = 0; s < pts.length - 1; s++) {
@@ -1252,6 +1297,7 @@ export default function Sparkbench() {
       paddingRight: narrow ? 'env(safe-area-inset-right)' : 12,
       boxSizing: 'border-box', userSelect: 'none', WebkitUserSelect: 'none',
       display: 'flex', flexDirection: 'column', overflow: 'hidden',
+      overscrollBehavior: 'none',
     }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@400;500;700&display=swap');
@@ -1335,11 +1381,32 @@ export default function Sparkbench() {
 
             {/* wires */}
             {wires.map((w) => {
-              const p = termOf(w.a), q = termOf(w.b);
-              if (!p || !q) return null;
-              const d = wirePath(p, q, w.vfirst, w.mid);
+              const pts = wireRoute(w, comps);
+              if (!pts) return null;
+              const p = pts[0], q = pts[pts.length - 1];
+              const d = 'M ' + pts.map((t) => t.x + ' ' + t.y).join(' L ');
               const I = res ? res.wire[w.id] || 0 : 0;
               const isSel = sel && sel.kind === 'wire' && sel.id === w.id;
+              /* arrow on the longest segment, pointing the way current flows */
+              let arrow = null;
+              if (Math.abs(I) > 3e-4) {
+                let bi = 0, bl = 0;
+                for (let i = 0; i < pts.length - 1; i++) {
+                  const L = Math.abs(pts[i + 1].x - pts[i].x) + Math.abs(pts[i + 1].y - pts[i].y);
+                  if (L > bl) { bl = L; bi = i; }
+                }
+                if (bl > 34) {
+                  const A = pts[bi], B = pts[bi + 1];
+                  let ang = (Math.atan2(B.y - A.y, B.x - A.x) * 180) / Math.PI;
+                  if (I < 0) ang += 180;
+                  arrow = (
+                    <g transform={`translate(${(A.x + B.x) / 2},${(A.y + B.y) / 2}) rotate(${ang})`}
+                      opacity={Math.min(1, Math.abs(I) / 0.003)} pointerEvents="none">
+                      <path d="M -5.5 -4.5 L 7 0 L -5.5 4.5 Z" fill={AMBER} stroke={BOARD} strokeWidth="1.2" strokeLinejoin="round" />
+                    </g>
+                  );
+                }
+              }
               return (
                 <g key={w.id}>
                   <path d={d} stroke={isSel ? BLUE : INK} strokeWidth="2.4" fill="none" strokeLinejoin="round" />
@@ -1348,6 +1415,7 @@ export default function Sparkbench() {
                       strokeDasharray="0.1 11" strokeDashoffset={phaseRef.current[w.id] || 0}
                       opacity={Math.min(1, Math.abs(I) / 0.002)} />
                   )}
+                  {arrow}
                   <path d={d} stroke="rgba(0,0,0,0)" strokeWidth="18" fill="none"
                     style={{ cursor: 'move' }}
                     onPointerDown={(e) => {
@@ -1427,17 +1495,18 @@ export default function Sparkbench() {
           {/* overlay: view controls (top-right) */}
           <div style={{ position: 'absolute', top: 8, right: 8, zIndex: 5, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
             <div style={overlayBar}>
+              {!narrow && (
+                <>
+                  <button title={running ? 'Stop the simulation' : 'Run the simulation'} style={chip(!running, { fontWeight: 700, padding: '5px 10px', border: 'none', background: running ? 'transparent' : '#fdf3df' })} onClick={() => setRunning((r) => !r)}>{running ? '⏸ Stop' : '▶ Run'}</button>
+                  <button title="Undo (Ctrl+Z)" disabled={!histLen} style={chip(false, { padding: '5px 10px', border: 'none', background: 'transparent', opacity: histLen ? 1 : 0.35 })} onClick={undo}>↩ Undo</button>
+                  <button title={muted ? 'Unmute buzzers' : audioReady ? 'Mute buzzers' : 'Tap to enable sound'} style={chip(false, { padding: '5px 9px', border: 'none', background: 'transparent' })} onClick={() => { ensureAudio(); audio.muted = !audio.muted; setMuted(audio.muted); }}>{muted ? '🔇' : audioReady ? '🔊' : '🔈'}</button>
+                  <div style={{ width: 1, alignSelf: 'stretch', background: '#e3dbc6', margin: '3px 2px' }} />
+                </>
+              )}
               <button title="Zoom out" style={chip(false, { padding: '5px 9px', border: 'none', background: 'transparent' })} onClick={() => zoomBy(1.25)}>−</button>
               <button title="Reset view" style={chip(false, { padding: '5px 9px', border: 'none', background: 'transparent' })} onClick={resetView}>⌂</button>
               <button title="Zoom in" style={chip(false, { padding: '5px 9px', border: 'none', background: 'transparent' })} onClick={() => zoomBy(1 / 1.25)}>+</button>
             </div>
-            {!narrow && (
-              <div style={overlayBar}>
-                <button title={running ? 'Stop the simulation' : 'Run the simulation'} style={chip(!running, { fontWeight: 700, padding: '5px 10px', border: 'none', background: running ? 'transparent' : '#fdf3df' })} onClick={() => setRunning((r) => !r)}>{running ? '⏸ Stop' : '▶ Run'}</button>
-                <button title="Undo (Ctrl+Z)" disabled={!histLen} style={chip(false, { padding: '5px 10px', border: 'none', background: 'transparent', opacity: histLen ? 1 : 0.35 })} onClick={undo}>↩ Undo</button>
-                <button title={muted ? 'Unmute buzzers' : audioReady ? 'Mute buzzers' : 'Tap to enable sound'} style={chip(false, { padding: '5px 9px', border: 'none', background: 'transparent' })} onClick={() => { ensureAudio(); audio.muted = !audio.muted; setMuted(audio.muted); }}>{muted ? '🔇' : audioReady ? '🔊' : '🔈'}</button>
-              </div>
-            )}
             {anyLdr && (
               <div style={{ ...overlayBar, padding: '5px 10px', gap: 7 }}>
                 <span style={{ fontSize: 14 }}>☾</span>
@@ -1448,7 +1517,7 @@ export default function Sparkbench() {
           </div>
 
           {/* overlay: palette dock (scrolls sideways) */}
-          <div className="sb-scroll" style={{ position: 'absolute', left: 8, right: 8, bottom: 8, zIndex: 5, display: 'flex', gap: 5, padding: 4, background: 'rgba(253,251,244,0.82)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)', border: '1.5px solid #ded6c2', borderRadius: 12 }}>
+          <div className="sb-scroll" style={{ position: 'absolute', left: 8, bottom: 8, width: 'calc(100% - 16px)', boxSizing: 'border-box', zIndex: 5, display: 'flex', gap: 5, padding: 4, justifyContent: narrow ? 'flex-start' : 'safe center', background: 'rgba(253,251,244,0.82)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)', border: '1.5px solid #ded6c2', borderRadius: 12 }}>
             {Object.keys(NAMES).map((t) => (
               <button key={t} style={palBtn(placing === t)}
                 onPointerDown={(e) => onPalDown(e, t)}
