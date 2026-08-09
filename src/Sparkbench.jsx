@@ -126,8 +126,13 @@ function pathPoints(p, q, vfirst, mid) {
   if (p.x === q.x || p.y === q.y) return [p, q];
   return vfirst ? [p, { x: p.x, y: q.y }, q] : [p, { x: q.x, y: p.y }, q];
 }
-/* which way a middle segment should run for this pair of endpoints */
-function midAxis(p, q) { return Math.abs(q.x - p.x) >= Math.abs(q.y - p.y) ? 'x' : 'y'; }
+/* which way a middle segment should run for this pair of endpoints —
+   perpendicular to a straight wire, so dragging it always bows out visibly */
+function midAxis(p, q) {
+  if (p.y === q.y) return 'y';
+  if (p.x === q.x) return 'x';
+  return Math.abs(q.x - p.x) >= Math.abs(q.y - p.y) ? 'x' : 'y';
+}
 function onSeg(P, A, B) {
   if (A.x === B.x) return P.x === A.x && P.y >= Math.min(A.y, B.y) && P.y <= Math.max(A.y, B.y);
   if (A.y === B.y) return P.y === A.y && P.x >= Math.min(A.x, B.x) && P.x <= Math.max(A.x, B.x);
@@ -1332,7 +1337,7 @@ export default function Sparkbench() {
             {wires.map((w) => {
               const p = termOf(w.a), q = termOf(w.b);
               if (!p || !q) return null;
-              const d = wirePath(p, q, w.vfirst);
+              const d = wirePath(p, q, w.vfirst, w.mid);
               const I = res ? res.wire[w.id] || 0 : 0;
               const isSel = sel && sel.kind === 'wire' && sel.id === w.id;
               return (
