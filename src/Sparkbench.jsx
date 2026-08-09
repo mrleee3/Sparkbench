@@ -823,6 +823,7 @@ export default function Sparkbench() {
   const sheetDragRef = useRef(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [audioReady, setAudioReady] = useState(false);
+  const [ctxMenu, setCtxMenu] = useState(null);
   const [, setTick] = useState(0);
 
   const svgRef = useRef(null);
@@ -846,6 +847,9 @@ export default function Sparkbench() {
   const ptrsRef = useRef(new Map());
   const pinchRef = useRef(null);
   const wireDragRef = useRef(null);
+  const lpRef = useRef(null);
+  const clearLP = () => { if (lpRef.current) { clearTimeout(lpRef.current); lpRef.current = null; } };
+  const armLP = (fn) => { clearLP(); lpRef.current = setTimeout(fn, 430); };
 
   useEffect(() => {
     audio.onState = setAudioReady;
@@ -941,7 +945,7 @@ export default function Sparkbench() {
     const onKey = (e) => {
       const tag = (document.activeElement && document.activeElement.tagName) || '';
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-      if (e.key === 'Escape') { setPlacing(null); setWiring(null); setSel(null); }
+      if (e.key === 'Escape') { setPlacing(null); setWiring(null); setSel(null); setCtxMenu(null); }
       else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); }
       else if (!e.ctrlKey && !e.metaKey && (e.key === 'r' || e.key === 'R')) rotateSel();
       else if (e.key === 'Delete' || e.key === 'Backspace') deleteSel();
@@ -980,6 +984,7 @@ export default function Sparkbench() {
       if (ptrsRef.current.size === 2) {
         const [a, b] = Array.from(ptrsRef.current.values());
         dragRef.current = null; panRef.current = null;   // a pinch is not a drag
+        if (lpRef.current) { clearTimeout(lpRef.current); lpRef.current = null; }
         setWiring(null); setPlacing(null);
         pinchRef.current = {
           d0: Math.hypot(a.x - b.x, a.y - b.y),
@@ -1109,15 +1114,26 @@ export default function Sparkbench() {
       setPlacing(placing === p.type ? null : p.type); setWiring(null); setSel(null);
     }
   };
-  const rotateSel = () => {
-    if (!sel || sel.kind !== 'comp') return;
-    pushHist();
-    const cur = compsRef.current.find((x) => x.id === sel.id);
+  const rotateBy = (id, deg) => {
+    const cur = compsRef.current.find((x) => x.id === id);
     if (!cur) return;
-    const rc = { ...cur, rot: ((cur.rot || 0) + 90) % 360 };
-    setComps((cs) => cs.map((x) => (x.id === sel.id ? rc : x)));
+    pushHist();
+    const rc = { ...cur, rot: ((cur.rot || 0) + deg) % 360 };
+    setComps((cs) => cs.map((x) => (x.id === id ? rc : x)));
     const nw = autoConnect(rc, compsRef.current, wiresRef.current, seqRef);
     if (nw) setWires(nw);
+  };
+  const rotateSel = () => { if (sel && sel.kind === 'comp') rotateBy(sel.id, 90); };
+  const duplicateComp = (id) => {
+    const cur = compsRef.current.find((x) => x.id === id);
+    if (!cur) return;
+    pushHist();
+    const nid = 'c' + seqRef.current++;
+    const nc = { ...cur, id: nid, x: snap(cur.x + 40), y: snap(cur.y + 40) };
+    setComps((cs) => [...cs, nc]);
+    const nw = autoConnect(nc, compsRef.current, wiresRef.current, seqRef);
+    if (nw) setWires(nw);
+    setSel({ kind: 'comp', id: nid });
   };
   const deleteSel = () => {
     if (!sel) return;
@@ -1140,6 +1156,7 @@ export default function Sparkbench() {
   /* --- pointer handlers --- */
   const onBgDown = (e) => {
     ensureAudio();
+    setCtxMenu(null);
     const p = svgPt(e);
     if (placing) { placeAt(p); return; }
     if (wiring) { setWiring(null); return; }
@@ -1148,15 +1165,26 @@ export default function Sparkbench() {
   const onCompDown = (e, c) => {
     e.stopPropagation();
     ensureAudio();
+    setCtxMenu(null);
     const p = svgPt(e);
     if (placing) { placeAt(p); return; }
     dragRef.current = {
       id: c.id, dx: p.x - c.x, dy: p.y - c.y, sx: p.x, sy: p.y, moved: false,
       hist: JSON.stringify({ comps: compsRef.current, wires: wiresRef.current }),
     };
+    const cx = e.clientX, cy = e.clientY;
+    armLP(() => {
+      const dr = dragRef.current;
+      if (!dr || dr.id !== c.id || dr.moved) return;
+      dragRef.current = null;
+      const r = svgRef.current.getBoundingClientRect();
+      setSel({ kind: 'comp', id: c.id });
+      setCtxMenu({ kind: 'comp', id: c.id, x: cx - r.left, y: cy - r.top });
+    });
   };
   const onTermDown = (e, cid, t) => {
     e.stopPropagation();
+    setCtxMenu(null);
     if (placing) { placeAt(svgPt(e)); return; }
     if (!wiring) { setWiring({ comp: cid, t }); return; }
     if (wiring.comp === cid && wiring.t === t) { setWiring(null); return; }
@@ -1171,11 +1199,11 @@ export default function Sparkbench() {
     setWiring(null);
   };
   const onMove = (e) => {
-    if (pinchRef.current) return;
+    if (pinchRef.current) { clearLP(); return; }
     const p = svgPt(e); ptrRef.current = p;
     const wd = wireDragRef.current;
     if (wd) {
-      if (!wd.moved && Math.hypot(p.x - wd.sx, p.y - wd.sy) > 6) wd.moved = true;
+      if (!wd.moved && Math.hypot(p.x - wd.sx, p.y - wd.sy) > 6) { wd.moved = true; clearLP(); }
       if (wd.moved) {
         const v = snap(wd.axis === 'x' ? p.x : p.y);
         setWires((ws) => ws.map((w) => (w.id === wd.id ? { ...w, mid: { a: wd.axis, v } } : w)));
@@ -1195,7 +1223,7 @@ export default function Sparkbench() {
     }
     const dr = dragRef.current;
     if (dr) {
-      if (Math.hypot(p.x - dr.sx, p.y - dr.sy) > 6) dr.moved = true;
+      if (Math.hypot(p.x - dr.sx, p.y - dr.sy) > 6) { dr.moved = true; clearLP(); }
       if (dr.moved) {
         const nx = snap(p.x - dr.dx), ny = snap(p.y - dr.dy);
         setComps((cs) => cs.map((x) => (x.id === dr.id ? { ...x, x: nx, y: ny } : x)));
@@ -1203,6 +1231,7 @@ export default function Sparkbench() {
     }
   };
   const onUp = () => {
+    clearLP();
     if (pinchRef.current || ptrsRef.current.size > 1) { dragRef.current = null; panRef.current = null; wireDragRef.current = null; return; }
     const wd = wireDragRef.current;
     if (wd) {
@@ -1288,14 +1317,13 @@ export default function Sparkbench() {
 
   return (
     <div style={{
-      position: narrow ? 'fixed' : 'relative', inset: narrow ? 0 : undefined,
-      minHeight: narrow ? undefined : '100vh',
+      position: 'fixed', inset: 0,
       background: PAPER, color: INK, fontFamily: MONO,
-      paddingTop: narrow ? 'env(safe-area-inset-top)' : 14,
-      paddingBottom: narrow ? 0 : 20,
+      paddingTop: narrow ? 'env(safe-area-inset-top)' : 12,
+      paddingBottom: narrow ? 0 : 8,
       paddingLeft: narrow ? 'env(safe-area-inset-left)' : 12,
       paddingRight: narrow ? 'env(safe-area-inset-right)' : 12,
-      boxSizing: 'border-box', userSelect: 'none', WebkitUserSelect: 'none',
+      boxSizing: 'border-box', userSelect: 'none', WebkitUserSelect: 'none', WebkitTouchCallout: 'none',
       display: 'flex', flexDirection: 'column', overflow: 'hidden',
       overscrollBehavior: 'none',
     }}>
@@ -1348,15 +1376,15 @@ export default function Sparkbench() {
 
         {/* board + inspector */}
         <div style={{ display: 'flex', gap: narrow ? 0 : 12, alignItems: 'stretch', flexDirection: narrow ? 'column' : 'row', flex: '1 1 auto', minHeight: 0 }}>
-        <div style={{ position: 'relative', flex: narrow ? '1 1 auto' : '3 1 560px', minWidth: 0, minHeight: narrow ? 180 : undefined, borderRadius: narrow ? 0 : 14, border: narrow ? 'none' : '1.5px solid #d5cdb8', borderTop: narrow ? '1.5px solid #e2dac6' : undefined, boxShadow: narrow ? 'none' : '0 2px 10px rgba(60,50,20,0.07)', overflow: 'hidden', background: BOARD }}>
+        <div style={{ position: 'relative', flex: narrow ? '1 1 auto' : '3 1 560px', minWidth: 0, minHeight: 180, borderRadius: narrow ? 0 : 14, border: narrow ? 'none' : '1.5px solid #d5cdb8', borderTop: narrow ? '1.5px solid #e2dac6' : undefined, boxShadow: narrow ? 'none' : '0 2px 10px rgba(60,50,20,0.07)', overflow: 'hidden', background: BOARD }}>
           <svg
             ref={svgRef}
             viewBox={`${view.x} ${view.y} ${view.w} ${viewH}`}
-            style={{ width: '100%', height: narrow ? '100%' : 'auto', display: 'block', aspectRatio: narrow ? undefined : `${W}/${H}`, touchAction: 'none', cursor: placing ? 'copy' : 'default' }}
+            style={{ width: '100%', height: '100%', display: 'block', touchAction: 'none', cursor: placing ? 'copy' : 'default' }}
             onPointerDown={onBgDown}
             onPointerMove={onMove}
             onPointerUp={onUp}
-            onPointerLeave={() => { dragRef.current = null; panRef.current = null; }}
+            onPointerLeave={() => { dragRef.current = null; panRef.current = null; clearLP(); }}
           >
             <defs>
               <pattern id="sbgrid" width="100" height="100" patternUnits="userSpaceOnUse">
@@ -1420,6 +1448,7 @@ export default function Sparkbench() {
                     style={{ cursor: 'move' }}
                     onPointerDown={(e) => {
                       e.stopPropagation();
+                      setCtxMenu(null);
                       if (placing) { placeAt(svgPt(e)); return; }
                       const s = svgPt(e);
                       wireDragRef.current = {
@@ -1428,6 +1457,14 @@ export default function Sparkbench() {
                         hist: JSON.stringify({ comps: compsRef.current, wires: wiresRef.current }),
                       };
                       setSel({ kind: 'wire', id: w.id });
+                      const cx = e.clientX, cy = e.clientY;
+                      armLP(() => {
+                        const wd = wireDragRef.current;
+                        if (!wd || wd.id !== w.id || wd.moved) return;
+                        wireDragRef.current = null;
+                        const r = svgRef.current.getBoundingClientRect();
+                        setCtxMenu({ kind: 'wire', id: w.id, x: cx - r.left, y: cy - r.top });
+                      });
                     }} />
                 </g>
               );
@@ -1529,6 +1566,32 @@ export default function Sparkbench() {
               </button>
             ))}
           </div>
+
+          {/* long-press context menu */}
+          {ctxMenu && (() => {
+            const c = ctxMenu.kind === 'comp' ? comps.find((x) => x.id === ctxMenu.id) : null;
+            const wSel = ctxMenu.kind === 'wire' ? wires.find((x) => x.id === ctxMenu.id) : null;
+            if (!c && !wSel) return null;
+            const r = svgRef.current ? svgRef.current.getBoundingClientRect() : { width: 600, height: 400 };
+            const wired = c && wires.some((x) => x.a.comp === c.id || x.b.comp === c.id);
+            const item = (label, fn, danger) => (
+              <button key={label}
+                style={{ display: 'block', width: '100%', textAlign: 'left', fontFamily: MONO, fontSize: 12.5, padding: '8px 14px', border: 'none', background: 'transparent', color: danger ? REDC : INK, cursor: 'pointer' }}
+                onClick={() => { setCtxMenu(null); fn(); }}>{label}</button>
+            );
+            return (
+              <div style={{ position: 'absolute', left: Math.max(8, Math.min(ctxMenu.x, r.width - 175)), top: Math.max(8, Math.min(ctxMenu.y, r.height - 250)), zIndex: 9, minWidth: 160, background: '#fffdf6', border: '1.5px solid #d9d2bf', borderRadius: 12, boxShadow: '0 8px 26px rgba(60,50,20,0.2)', padding: '3px 0', overflow: 'hidden' }}>
+                <div style={{ fontSize: 10.5, color: MUT, padding: '6px 14px 2px' }}>{c ? NAMES[c.type] : 'Wire'}</div>
+                {c && item('⟳  Rotate 90°', () => rotateBy(c.id, 90))}
+                {c && item('⇅  Rotate 180°', () => rotateBy(c.id, 180))}
+                {c && item('⧉  Duplicate', () => duplicateComp(c.id))}
+                {c && wired && item('✂  Disconnect', () => { pushHist(); setWires((ws) => ws.filter((x) => x.a.comp !== c.id && x.b.comp !== c.id)); })}
+                {c && c.type === 'led' && devRef.current[c.id] && devRef.current[c.id].blown && item('✨  Replace LED', () => { devRef.current[c.id] = { vPrev: 0, on: false, mode: 'off', hot: 0, blown: false }; })}
+                {wSel && wSel.mid && item('↔  Straighten', () => { pushHist(); setWires((ws) => ws.map((x) => (x.id === wSel.id ? { ...x, mid: undefined } : x))); })}
+                {item('🗑  Delete', deleteSel, true)}
+              </div>
+            );
+          })()}
 
           {/* short circuit banner */}
           {res && res.short && (
@@ -1736,9 +1799,8 @@ export default function Sparkbench() {
         </div>
 
         {!narrow && (
-        <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, fontSize: 10.5, color: '#a29a86' }}>
-          <span>drop a part onto a wire to splice it in · hollow dots = not connected yet · LEDs past ~30 mA really do blow</span>
-          <span>drag empty board to pan · scroll to zoom · solver: modified nodal analysis · autosaves</span>
+        <div style={{ marginTop: 6, fontSize: 10.5, color: '#a29a86', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', flex: '0 0 auto' }}>
+          drop parts onto wires to splice · hollow dots = unconnected · long-press for options · drag board to pan · scroll to zoom · LEDs past ~30 mA really blow · autosaves
         </div>
         )}
       </div>
