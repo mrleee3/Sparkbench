@@ -111,16 +111,23 @@ function getTerminals(c) {
   if (c.type === 'npn') return [P(0, 0), P(40, -40), P(40, 40)]; // B, C, E
   return [P(0, 0), P(80, 0)];
 }
-function wirePath(p, q, vfirst) {
-  if (p.x === q.x || p.y === q.y) return `M ${p.x} ${p.y} L ${q.x} ${q.y}`;
-  return vfirst
-    ? `M ${p.x} ${p.y} L ${p.x} ${q.y} L ${q.x} ${q.y}`
-    : `M ${p.x} ${p.y} L ${q.x} ${p.y} L ${q.x} ${q.y}`;
+/* Wires route as an L by default. Once dragged, they carry a `mid` — the
+   position of a middle segment — and route as a Z through it. */
+function wirePath(p, q, vfirst, mid) {
+  const pts = pathPoints(p, q, vfirst, mid);
+  return 'M ' + pts.map((t) => t.x + ' ' + t.y).join(' L ');
 }
-function pathPoints(p, q, vfirst) {
+function pathPoints(p, q, vfirst, mid) {
+  if (mid && typeof mid.v === 'number') {
+    return mid.a === 'x'
+      ? [p, { x: mid.v, y: p.y }, { x: mid.v, y: q.y }, q]
+      : [p, { x: p.x, y: mid.v }, { x: q.x, y: mid.v }, q];
+  }
   if (p.x === q.x || p.y === q.y) return [p, q];
   return vfirst ? [p, { x: p.x, y: q.y }, q] : [p, { x: q.x, y: p.y }, q];
 }
+/* which way a middle segment should run for this pair of endpoints */
+function midAxis(p, q) { return Math.abs(q.x - p.x) >= Math.abs(q.y - p.y) ? 'x' : 'y'; }
 function onSeg(P, A, B) {
   if (A.x === B.x) return P.x === A.x && P.y >= Math.min(A.y, B.y) && P.y <= Math.max(A.y, B.y);
   if (A.y === B.y) return P.y === A.y && P.x >= Math.min(A.x, B.x) && P.x <= Math.max(A.x, B.x);
@@ -170,7 +177,7 @@ function autoConnect(c, comps, wires, seqRef) {
     if (w.a.comp === c.id || w.b.comp === c.id) return;
     const p = termOfIn(comps, w.a), q = termOfIn(comps, w.b);
     if (!p || !q) return;
-    const pts = pathPoints(p, q, w.vfirst);
+    const pts = pathPoints(p, q, w.vfirst, w.mid);
     terms.forEach((P, ti) => {
       if ((P.x === p.x && P.y === p.y) || (P.x === q.x && P.y === q.y)) return;
       for (let s = 0; s < pts.length - 1; s++) {
@@ -202,7 +209,7 @@ function autoConnect(c, comps, wires, seqRef) {
     const chain = [w.a, ...hs.map((h) => ({ comp: c.id, t: h.ti })), w.b];
     for (let i = 0; i < chain.length - 1; i++) {
       if (chain[i].comp === c.id && chain[i + 1].comp === c.id) continue; // the part's body is that link
-      added.push({ id: 'w' + seqRef.current++, a: chain[i], b: chain[i + 1], vfirst: w.vfirst });
+      added.push({ id: 'w' + seqRef.current++, a: chain[i], b: chain[i + 1], vfirst: w.vfirst, mid: w.mid });
     }
     changed = true;
   });
@@ -762,6 +769,8 @@ export default function Sparkbench() {
   const [boxAR, setBoxAR] = useState(H / W);
   const [narrow, setNarrow] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(true);
+  const [sheetH, setSheetH] = useState(38);   // % of viewport height, user-adjustable
+  const sheetDragRef = useRef(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [audioReady, setAudioReady] = useState(false);
   const [, setTick] = useState(0);
@@ -786,6 +795,7 @@ export default function Sparkbench() {
   const viewRef = useRef(view); viewRef.current = view;
   const ptrsRef = useRef(new Map());
   const pinchRef = useRef(null);
+  const wireDragRef = useRef(null);
 
   useEffect(() => {
     audio.onState = setAudioReady;
@@ -1113,6 +1123,15 @@ export default function Sparkbench() {
   const onMove = (e) => {
     if (pinchRef.current) return;
     const p = svgPt(e); ptrRef.current = p;
+    const wd = wireDragRef.current;
+    if (wd) {
+      if (!wd.moved && Math.hypot(p.x - wd.sx, p.y - wd.sy) > 6) wd.moved = true;
+      if (wd.moved) {
+        const v = snap(wd.axis === 'x' ? p.x : p.y);
+        setWires((ws) => ws.map((w) => (w.id === wd.id ? { ...w, mid: { a: wd.axis, v } } : w)));
+      }
+      return;
+    }
     const pn = panRef.current;
     if (pn) {
       if (Math.hypot(e.clientX - pn.sx, e.clientY - pn.sy) > 5) pn.moved = true;
@@ -1134,7 +1153,21 @@ export default function Sparkbench() {
     }
   };
   const onUp = () => {
-    if (pinchRef.current || ptrsRef.current.size > 1) { dragRef.current = null; panRef.current = null; return; }
+    if (pinchRef.current || ptrsRef.current.size > 1) { dragRef.current = null; panRef.current = null; wireDragRef.current = null; return; }
+    const wd = wireDragRef.current;
+    if (wd) {
+      wireDragRef.current = null;
+      if (wd.moved) pushSnap(wd.hist);
+      else {
+        // tap on a straight-run wire it has been dragged before: reset to auto routing
+        const w = wiresRef.current.find((x) => x.id === wd.id);
+        if (w && w.mid && sel && sel.kind === 'wire' && sel.id === wd.id) {
+          pushHist();
+          setWires((ws) => ws.map((x) => (x.id === wd.id ? { ...x, mid: undefined } : x)));
+        }
+      }
+      return;
+    }
     const pn = panRef.current;
     if (pn) { panRef.current = null; if (!pn.moved) setSel(null); return; }
     const dr = dragRef.current;
@@ -1143,7 +1176,14 @@ export default function Sparkbench() {
       if (!dr.moved) {
         const c = compsRef.current.find((x) => x.id === dr.id);
         if (c) {
+          const wired = wiresRef.current.some((w) => w.a.comp === c.id || w.b.comp === c.id);
+          const already = sel && sel.kind === 'comp' && sel.id === c.id;
           if (c.type === 'switch') setComps((cs) => cs.map((x) => (x.id === c.id ? { ...x, closed: !x.closed } : x)));
+          else if (already && !wired) {
+            // nothing attached, so spinning it can't break anything — tap again to turn
+            pushHist();
+            setComps((cs) => cs.map((x) => (x.id === c.id ? { ...x, rot: ((x.rot || 0) + 90) % 360 } : x)));
+          }
           setSel({ kind: 'comp', id: c.id });
         }
       } else {
@@ -1202,7 +1242,7 @@ export default function Sparkbench() {
       minHeight: narrow ? undefined : '100vh',
       background: PAPER, color: INK, fontFamily: MONO,
       paddingTop: narrow ? 'env(safe-area-inset-top)' : 14,
-      paddingBottom: narrow ? 'env(safe-area-inset-bottom)' : 20,
+      paddingBottom: narrow ? 0 : 20,
       paddingLeft: narrow ? 'env(safe-area-inset-left)' : 12,
       paddingRight: narrow ? 'env(safe-area-inset-right)' : 12,
       boxSizing: 'border-box', userSelect: 'none', WebkitUserSelect: 'none',
@@ -1239,6 +1279,7 @@ export default function Sparkbench() {
             <div style={{ display: 'flex', gap: 5, alignItems: 'center' }}>
               <button title={running ? 'Stop' : 'Run'} style={chip(!running, { fontWeight: 700, padding: '5px 9px' })} onClick={() => setRunning((r) => !r)}>{running ? '⏸' : '▶'}</button>
               <button title="Undo" disabled={!histLen} style={chip(false, { padding: '5px 9px', opacity: histLen ? 1 : 0.35 })} onClick={undo}>↩</button>
+              <button title="Clear the board" style={chip(false, { padding: '5px 9px', color: MUT })} onClick={clearAll}>⌫</button>
               <button title={muted ? 'Unmute' : 'Mute'} style={chip(false, { padding: '5px 9px' })} onClick={() => { ensureAudio(); audio.muted = !audio.muted; setMuted(audio.muted); }}>{muted ? '🔇' : audioReady ? '🔊' : '🔈'}</button>
               <button title="Examples" style={chip(menuOpen, { padding: '5px 9px' })} onClick={() => setMenuOpen((m) => !m)}>⋯</button>
             </div>
@@ -1251,7 +1292,6 @@ export default function Sparkbench() {
             {PRESETS.map((p, i) => (
               <button key={i} style={chip(false, { textAlign: 'left' })} onClick={() => { loadPreset(i); setMenuOpen(false); }}>{p.label}</button>
             ))}
-            <button style={chip(false, { color: MUT, textAlign: 'left' })} onClick={() => { clearAll(); setMenuOpen(false); }}>Clear</button>
           </div>
         )}
 
@@ -1304,8 +1344,18 @@ export default function Sparkbench() {
                       opacity={Math.min(1, Math.abs(I) / 0.002)} />
                   )}
                   <path d={d} stroke="rgba(0,0,0,0)" strokeWidth="18" fill="none"
-                    style={{ cursor: 'pointer' }}
-                    onPointerDown={(e) => { e.stopPropagation(); if (placing) { placeAt(svgPt(e)); return; } setSel({ kind: 'wire', id: w.id }); }} />
+                    style={{ cursor: 'move' }}
+                    onPointerDown={(e) => {
+                      e.stopPropagation();
+                      if (placing) { placeAt(svgPt(e)); return; }
+                      const s = svgPt(e);
+                      wireDragRef.current = {
+                        id: w.id, sx: s.x, sy: s.y, moved: false,
+                        axis: w.mid ? w.mid.a : midAxis(p, q),
+                        hist: JSON.stringify({ comps: compsRef.current, wires: wiresRef.current }),
+                      };
+                      setSel({ kind: 'wire', id: w.id });
+                    }} />
                 </g>
               );
             })}
@@ -1425,18 +1475,39 @@ export default function Sparkbench() {
         <div style={{
           flex: narrow ? '0 0 auto' : '1 1 300px', minWidth: narrow ? 0 : 270, maxWidth: narrow ? '100%' : 420,
           background: '#fffdf6', border: narrow ? 'none' : '1.5px solid #d9d2bf', borderTop: narrow ? '1.5px solid #ded6c2' : undefined,
-          borderRadius: narrow ? '14px 14px 0 0' : 14, padding: narrow ? '0 12px 10px' : '12px 14px', fontSize: 12.5,
-          boxShadow: narrow ? '0 -3px 14px rgba(60,50,20,0.08)' : '0 2px 10px rgba(60,50,20,0.06)',
-          maxHeight: narrow ? (sheetOpen ? '46dvh' : 46) : undefined, overflowY: 'auto', overflowX: 'hidden',
+          borderRadius: narrow ? 0 : 14,
+          padding: narrow ? '0 12px' : '12px 14px',
+          paddingBottom: narrow ? 'env(safe-area-inset-bottom)' : 14,
+          fontSize: 12.5,
+          boxShadow: narrow ? '0 -3px 14px rgba(60,50,20,0.06)' : '0 2px 10px rgba(60,50,20,0.06)',
+          height: narrow ? (sheetOpen ? `calc(${sheetH}dvh + env(safe-area-inset-bottom))` : 'calc(42px + env(safe-area-inset-bottom))') : undefined,
+          boxSizing: 'border-box',
+          overflowY: 'auto', overflowX: 'hidden',
           overscrollBehavior: 'contain', WebkitOverflowScrolling: 'touch',
         }}>
           {narrow && (
-            <div onClick={() => setSheetOpen((s) => !s)}
-              style={{ position: 'sticky', top: 0, zIndex: 2, background: '#fffdf6', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '10px 0 8px', cursor: 'pointer' }}>
+            <div
+              onPointerDown={(e) => {
+                if (!sheetOpen) return;
+                e.currentTarget.setPointerCapture(e.pointerId);
+                sheetDragRef.current = { y: e.clientY, h: sheetH, moved: false };
+              }}
+              onPointerMove={(e) => {
+                const s = sheetDragRef.current; if (!s) return;
+                const dvh = ((s.y - e.clientY) / window.innerHeight) * 100;
+                if (Math.abs(dvh) > 0.8) s.moved = true;
+                if (s.moved) setSheetH(Math.max(18, Math.min(72, s.h + dvh)));
+              }}
+              onPointerUp={() => {
+                const s = sheetDragRef.current; sheetDragRef.current = null;
+                if (s && !s.moved) setSheetOpen((o) => !o);
+              }}
+              onClick={() => { if (!sheetOpen) setSheetOpen(true); }}
+              style={{ position: 'sticky', top: 0, zIndex: 2, background: '#fffdf6', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '9px 0 7px', cursor: sheetOpen ? 'ns-resize' : 'pointer', touchAction: 'none' }}>
               <span style={{ fontSize: 11.5, color: MUT, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {sheetOpen ? 'Circuit · diagnostics · selected part' : (diags[0] ? diags[0].text : 'Details')}
               </span>
-              <span style={{ color: MUT, fontSize: 13 }}>{sheetOpen ? '⌄' : '⌃'}</span>
+              <span style={{ color: '#c9c1ad', fontSize: 13, letterSpacing: 1 }}>{sheetOpen ? '⌃⌄' : '⌃'}</span>
             </div>
           )}
 
@@ -1575,6 +1646,13 @@ export default function Sparkbench() {
             <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
               <span style={{ fontWeight: 700 }}>Wire</span>
               {running && res && <span style={{ color: MUT, fontSize: 11.5 }}>{fmtI(Math.abs(res.wire[sel.id] || 0))} through it</span>}
+              <span style={{ color: MUT, fontSize: 11 }}>drag it to reroute</span>
+              {wires.some((w) => w.id === sel.id && w.mid) && (
+                <button style={chip(false, { padding: '4px 10px' })}
+                  onClick={() => { pushHist(); setWires((ws) => ws.map((w) => (w.id === sel.id ? { ...w, mid: undefined } : w))); }}>
+                  ↔ Straighten
+                </button>
+              )}
               <button style={chip(false, { padding: '4px 10px', color: REDC, borderColor: '#e5c3bb' })} onClick={deleteSel}>Delete</button>
             </div>
           ) : (
