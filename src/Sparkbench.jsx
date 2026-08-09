@@ -25,7 +25,7 @@ const VTH = 0.65, RBE = 150, BETA = 100, VSAT = 0.2, GSAT = 2;
 
 const NAMES = { battery: 'Battery', resistor: 'Resistor', led: 'LED', buzzer: 'Buzzer', switch: 'Switch', capacitor: 'Capacitor', ldr: 'Light sensor (LDR)', npn: 'Transistor (NPN)' };
 const BUZ_R = 300, BUZ_VON = 1.5; // active buzzer: ~300R load, sings above ~1.5 V forward
-const R_VALUES = [100, 220, 470, 1000, 4700, 10000, 100000];
+const R_VALUES = [100, 220, 330, 470, 1000, 4700, 10000, 100000];
 const C_VALUES = [0.0001, 0.00047, 0.001, 0.0047];
 const B_VALUES = [3, 6, 9];
 
@@ -476,6 +476,156 @@ const PRESETS = [
   },
 ];
 
+/* ---------- tutorials: scripted steps with deterministic completion checks ----------
+   Each check is a plain predicate over the live circuit — the app knows exactly
+   when the child has done the step, so the ✓ appears by itself. No AI involved. */
+function firstOf(ctx, type) { return ctx.comps.find((c) => c.type === type); }
+function compD(ctx, c) { return c && ctx.res ? ctx.res.comp[c.id] : null; }
+function isSelType(ctx, type) {
+  if (!ctx.sel || ctx.sel.kind !== 'comp') return false;
+  const c = ctx.comps.find((x) => x.id === ctx.sel.id);
+  return !!c && c.type === type;
+}
+function fullyWired(ctx, c) {
+  if (!c) return false;
+  const s = new Set();
+  ctx.wires.forEach((w) => { s.add(w.a.comp + ':' + w.a.t); s.add(w.b.comp + ':' + w.b.t); });
+  return s.has(c.id + ':0') && s.has(c.id + ':1');
+}
+
+const TUT_LOOP = (rv) => ({
+  comps: [
+    { id: 'tb', type: 'battery', x: 260, y: 160, rot: 90, value: 9 },
+    { id: 'tr', type: 'resistor', x: 380, y: 120, rot: 0, value: rv },
+    { id: 'tl', type: 'led', x: 540, y: 120, rot: 0, value: 'red' },
+  ],
+  wires: [
+    { id: 'tw1', a: { comp: 'tb', t: 0 }, b: { comp: 'tr', t: 0 }, vfirst: true },
+    { id: 'tw2', a: { comp: 'tr', t: 1 }, b: { comp: 'tl', t: 0 } },
+    { id: 'tw3', a: { comp: 'tl', t: 1 }, b: { comp: 'tb', t: 1 } },
+  ],
+});
+
+const TUTORIALS = [
+  {
+    id: 't1', title: 'First light', emoji: '⚡',
+    blurb: 'Build your first circuit — and blow your first LED',
+    start: { clear: true },
+    steps: [
+      {
+        text: 'Every circuit needs a push. Add a battery — tap it in the palette, then tap the board.',
+        hint: 'battery',
+        check: (ctx) => !!firstOf(ctx, 'battery'),
+        done: 'That’s your pump: it pushes charge out of + and pulls it home at −.',
+      },
+      {
+        text: 'Now something to power: add an LED.',
+        hint: 'led',
+        check: (ctx) => !!firstOf(ctx, 'led'),
+        done: 'The triangle is an arrow — current can only flow the way it points.',
+      },
+      {
+        text: 'Wire the LED and battery into a loop: tap one terminal dot, then another. Make the triangle point the way round the loop.',
+        check: (ctx) => {
+          const l = firstOf(ctx, 'led');
+          if (!l) return false;
+          const st = ctx.dev[l.id] || {};
+          const d = compD(ctx, l);
+          return !!st.blown || (d && d.I > 1e-3);
+        },
+        done: '💥 Poof! With nothing to slow it down, over half an amp stampeded through. An LED can never set its own current.',
+      },
+      {
+        text: 'Bring it back to life: long-press the LED and tap ✨ Replace.',
+        check: (ctx) => {
+          const l = firstOf(ctx, 'led');
+          return !!l && !(ctx.dev[l.id] || {}).blown;
+        },
+        done: 'Good as new. This time, let’s protect it.',
+      },
+      {
+        text: 'Add a resistor to guard the LED — drag one from the palette and drop it right onto a wire to splice it in.',
+        hint: 'resistor',
+        check: (ctx) => {
+          const l = firstOf(ctx, 'led');
+          const d = compD(ctx, l);
+          return !!firstOf(ctx, 'resistor') && d && d.I > 1e-3 && d.I < 0.03 && !(ctx.dev[l.id] || {}).blown;
+        },
+        done: 'Lit — and safe. The resistor sets the current; the LED just enjoys it.',
+      },
+      {
+        text: 'Tap the LED and look at its numbers in the panel.',
+        check: (ctx) => isSelType(ctx, 'led'),
+        done: 'About 1.8 V and a healthy current. Push, limit, payload, loop — the fundamental circuit. 🎉',
+      },
+    ],
+  },
+  {
+    id: 't2', title: 'Ohm’s playground', emoji: '🎛',
+    blurb: 'Turn the current up and down with resistance',
+    start: TUT_LOOP(1000),
+    steps: [
+      {
+        text: 'Here’s a working loop. Tap the resistor to meet Ohm’s law with your real numbers.',
+        check: (ctx) => isSelType(ctx, 'resistor'),
+        done: 'V = I × R — the resistor charges a voltage toll for letting current through.',
+      },
+      {
+        text: 'More current, please: set the resistor to 470 Ω with the value chips in the panel.',
+        check: (ctx) => ctx.comps.some((c) => c.type === 'resistor' && c.value === 470),
+        done: 'Brighter! Half the resistance, roughly double the current.',
+      },
+      {
+        text: 'Now nudge your luck: try 330 Ω and keep an eye on Diagnostics.',
+        check: (ctx) => ctx.comps.some((c) => c.type === 'resistor' && c.value === 330),
+        done: 'About 21 mA — running hot. Diagnostics is warning you: it works, but past ~30 mA it’s smoke.',
+      },
+      {
+        text: 'Be kind again: 1 kΩ or higher.',
+        check: (ctx) => ctx.comps.some((c) => c.type === 'resistor' && c.value >= 1000),
+        done: 'A gentle few milliamps — dimmer, but this LED will outlive us all.',
+      },
+      {
+        text: 'Last one: tap the battery. Its power, P = V × I, changed every time you did.',
+        check: (ctx) => isSelType(ctx, 'battery'),
+        done: 'The resistor decides the current, and the current decides everything else. 🎉',
+      },
+    ],
+  },
+  {
+    id: 't3', title: 'Take control', emoji: '🕹',
+    blurb: 'Switches, and where the volts wait',
+    start: TUT_LOOP(470),
+    steps: [
+      {
+        text: 'Add a switch — drag one out and drop it straight onto the bottom wire to splice it in.',
+        hint: 'switch',
+        check: (ctx) => fullyWired(ctx, firstOf(ctx, 'switch')),
+        done: 'In the loop. Tapping a switch flips it.',
+      },
+      {
+        text: 'Turn the LED off with the switch.',
+        check: (ctx) => { const s = firstOf(ctx, 'switch'); return !!s && !s.closed; },
+        done: 'Loop broken — the current stops everywhere at once, not just at the gap.',
+      },
+      {
+        text: 'Where did the 9 volts go? Tap the switch, then check “where the volts go” in the panel.',
+        check: (ctx) => isSelType(ctx, 'switch'),
+        done: 'The open switch holds almost the whole 9 V across its gap — pressure waiting for a path.',
+      },
+      {
+        text: 'Let it flow: close the switch.',
+        check: (ctx) => {
+          const s = firstOf(ctx, 'switch'), l = firstOf(ctx, 'led');
+          const d = compD(ctx, l);
+          return !!s && !!s.closed && d && d.I > 1e-3;
+        },
+        done: 'And pressure becomes flow. That’s every light switch in your house. 🎉',
+      },
+    ],
+  },
+];
+
 /* ---------- schematic symbols (local coords, terminals at (0,0) and (80,0)) ---------- */
 function SymbolBody({ c, st, d, light }) {
   const rot = c.rot || 0;
@@ -824,6 +974,9 @@ export default function Sparkbench() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [audioReady, setAudioReady] = useState(false);
   const [ctxMenu, setCtxMenu] = useState(null);
+  const [tut, setTut] = useState(null);          // { id, step }
+  const [tutDone, setTutDone] = useState({});
+  const tutLatchRef = useRef({});
   const [, setTick] = useState(0);
 
   const svgRef = useRef(null);
@@ -869,6 +1022,10 @@ export default function Sparkbench() {
   useEffect(() => {
     (async () => {
       try {
+        try {
+          const tr = await store.get('sparkbench:tut');
+          if (tr && tr.value) setTutDone(JSON.parse(tr.value));
+        } catch (e) { /* fresh start */ }
         const r = await store.get('sparkbench:v1');
         if (r && r.value) {
           const d = JSON.parse(r.value);
@@ -1114,6 +1271,37 @@ export default function Sparkbench() {
       setPlacing(placing === p.type ? null : p.type); setWiring(null); setSel(null);
     }
   };
+  const startTutorial = (t) => {
+    pushHist();
+    devRef.current = {}; phaseRef.current = {};
+    if (t.start && t.start.comps) {
+      const p = JSON.parse(JSON.stringify(t.start));
+      setComps(p.comps); setWires(p.wires);
+      fitTo(p.comps);
+    } else {
+      setComps([]); setWires([]);
+      setView({ x: 0, y: 0, w: W });
+    }
+    setSel(null); setWiring(null); setPlacing(null); setCtxMenu(null); setMenuOpen(false);
+    setLight(100); setRunning(true);
+    tutLatchRef.current = {};
+    setTut({ id: t.id, step: 0 });
+  };
+  const exitTutorial = () => setTut(null);
+  const advanceTut = () => {
+    if (!tut) return;
+    const def = TUTORIALS.find((t) => t.id === tut.id);
+    if (!def) { setTut(null); return; }
+    if (tut.step >= def.steps.length - 1) {
+      const next = { ...tutDone, [tut.id]: true };
+      setTutDone(next);
+      try { store.set('sparkbench:tut', JSON.stringify(next)).catch(() => {}); } catch (e) { /* best effort */ }
+      setTut(null);
+    } else {
+      setTut({ id: tut.id, step: tut.step + 1 });
+    }
+  };
+
   const rotateBy = (id, deg) => {
     const cur = compsRef.current.find((x) => x.id === id);
     if (!cur) return;
@@ -1157,6 +1345,7 @@ export default function Sparkbench() {
   const onBgDown = (e) => {
     ensureAudio();
     setCtxMenu(null);
+    setMenuOpen(false);
     const p = svgPt(e);
     if (placing) { placeAt(p); return; }
     if (wiring) { setWiring(null); return; }
@@ -1286,14 +1475,26 @@ export default function Sparkbench() {
   const anyBlown = comps.some((c) => c.type === 'led' && devRef.current[c.id] && devRef.current[c.id].blown);
 
   /* transient only — nothing permanent sitting over the circuit */
-  const hint = res && res.short ? null
+  const hint = tut ? null
+    : res && res.short ? null
     : placing ? 'Drop the ' + NAMES[placing].toLowerCase() + ' on the board'
     : wiring ? 'Tap another terminal dot to finish the wire'
     : anyBlown ? 'An LED has blown — select it and tap Replace'
+    : comps.length === 0 && !Object.keys(tutDone).length ? 'New here? Tap ' + (narrow ? '⋯' : '🎓 Learn') + ' for a guided start'
     : null;
 
   const loop = running && res ? seriesLoop(comps, wires) : null;
   const diags = diagnose(comps, wires, res, devRef.current, running, audioReady);
+
+  const tutDef = tut ? TUTORIALS.find((t) => t.id === tut.id) : null;
+  const tutStep = tutDef ? tutDef.steps[tut.step] : null;
+  if (tutStep) {
+    let okNow = false;
+    try { okNow = !!tutStep.check({ comps, wires, res, dev: devRef.current, sel, light }); } catch (e) { okNow = false; }
+    if (okNow) tutLatchRef.current[tut.step] = true;
+  }
+  const stepOk = tutStep ? !!tutLatchRef.current[tut.step] : false;
+  const hintPal = tutStep && !stepOk ? tutStep.hint : null;
 
   /* --- styles --- */
   const chip = (active, extra) => ({
@@ -1330,6 +1531,8 @@ export default function Sparkbench() {
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@400;500;700&display=swap');
         .sb-pulse { animation: sbp 1s ease-in-out infinite; }
+        .sb-hint { animation: sbh 1.15s ease-in-out infinite; }
+        @keyframes sbh { 0%,100% { box-shadow: 0 0 0 0 rgba(233,147,15,0); } 50% { box-shadow: 0 0 0 6px rgba(233,147,15,0.35); } }
         @keyframes sbp { 0%,100%{opacity:.95} 50%{opacity:.25} }
         button { -webkit-tap-highlight-color: transparent; }
         button:hover { filter: brightness(0.98); }
@@ -1348,6 +1551,7 @@ export default function Sparkbench() {
           </div>
           {!narrow && (
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              <button style={chip(menuOpen, { fontWeight: 700 })} onClick={() => setMenuOpen((m) => !m)}>🎓 Learn</button>
               {PRESETS.map((p, i) => (
                 <button key={i} style={chip(false)} onClick={() => loadPreset(i)}>{p.label}</button>
               ))}
@@ -1365,12 +1569,27 @@ export default function Sparkbench() {
           )}
         </div>
 
-        {/* examples menu (phone) */}
-        {narrow && menuOpen && (
-          <div style={{ position: 'absolute', top: 44, right: 12, zIndex: 20, background: '#fffdf6', border: '1.5px solid #d9d2bf', borderRadius: 12, padding: 6, boxShadow: '0 6px 20px rgba(60,50,20,0.16)', display: 'flex', flexDirection: 'column', gap: 4 }}>
-            {PRESETS.map((p, i) => (
-              <button key={i} style={chip(false, { textAlign: 'left' })} onClick={() => { loadPreset(i); setMenuOpen(false); }}>{p.label}</button>
+        {/* learn + examples menu */}
+        {menuOpen && (
+          <div style={{ position: 'absolute', top: narrow ? 44 : 54, right: 12, zIndex: 20, width: 272, background: '#fffdf6', border: '1.5px solid #d9d2bf', borderRadius: 12, padding: 6, boxShadow: '0 6px 20px rgba(60,50,20,0.16)', display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <div style={{ fontSize: 10.5, color: MUT, padding: '2px 8px 0' }}>Tutorials</div>
+            {TUTORIALS.map((t) => (
+              <button key={t.id} style={chip(false, { textAlign: 'left', display: 'block' })} onClick={() => startTutorial(t)}>
+                <span style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                  <span>{t.emoji} {t.title}</span>
+                  {tutDone[t.id] && <span style={{ color: '#2fa46a' }}>✓</span>}
+                </span>
+                <span style={{ display: 'block', fontSize: 10, color: MUT, marginTop: 1 }}>{t.blurb}</span>
+              </button>
             ))}
+            {narrow && (
+              <>
+                <div style={{ fontSize: 10.5, color: MUT, padding: '4px 8px 0' }}>Examples</div>
+                {PRESETS.map((p, i) => (
+                  <button key={i} style={chip(false, { textAlign: 'left' })} onClick={() => { loadPreset(i); setMenuOpen(false); }}>{p.label}</button>
+                ))}
+              </>
+            )}
           </div>
         )}
 
@@ -1557,6 +1776,7 @@ export default function Sparkbench() {
           <div className="sb-scroll" style={{ position: 'absolute', left: 8, bottom: 8, width: 'calc(100% - 16px)', boxSizing: 'border-box', zIndex: 5, display: 'flex', gap: 5, padding: 4, justifyContent: narrow ? 'flex-start' : 'safe center', background: 'rgba(253,251,244,0.82)', backdropFilter: 'blur(6px)', WebkitBackdropFilter: 'blur(6px)', border: '1.5px solid #ded6c2', borderRadius: 12 }}>
             {Object.keys(NAMES).map((t) => (
               <button key={t} style={palBtn(placing === t)}
+                className={hintPal === t ? 'sb-hint' : undefined}
                 onPointerDown={(e) => onPalDown(e, t)}
                 onPointerMove={onPalMove}
                 onPointerUp={onPalUp}
@@ -1593,9 +1813,35 @@ export default function Sparkbench() {
             );
           })()}
 
+          {/* tutorial card */}
+          {tutDef && tutStep && (
+            <div style={{ position: 'absolute', top: 8, left: 8, zIndex: 7, width: 'min(310px, 64%)', background: 'rgba(255,253,246,0.97)', border: '1.5px solid #d9d2bf', borderRadius: 12, padding: '9px 12px', boxShadow: '0 4px 16px rgba(60,50,20,0.14)' }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 }}>
+                <span style={{ fontFamily: SERIF, fontStyle: 'italic', fontSize: 15 }}>{tutDef.emoji} {tutDef.title}</span>
+                <span style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+                  <span style={{ fontSize: 10, color: MUT }}>step {tut.step + 1}/{tutDef.steps.length}</span>
+                  <button title="Exit tutorial" style={{ border: 'none', background: 'transparent', color: MUT, cursor: 'pointer', fontSize: 13, padding: 0, fontFamily: MONO }} onClick={exitTutorial}>✕</button>
+                </span>
+              </div>
+              <div style={{ fontSize: 12, marginTop: 5, lineHeight: 1.5 }}>{tutStep.text}</div>
+              {stepOk && (
+                <div style={{ marginTop: 6, fontSize: 11.5, color: '#22794f', lineHeight: 1.45 }}>✓ {tutStep.done}</div>
+              )}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 8 }}>
+                <button disabled={!stepOk}
+                  className={stepOk ? 'sb-hint' : undefined}
+                  style={chip(stepOk, { fontWeight: 700, padding: '5px 14px', opacity: stepOk ? 1 : 0.4, cursor: stepOk ? 'pointer' : 'default' })}
+                  onClick={advanceTut}>
+                  {tut.step === tutDef.steps.length - 1 ? 'Finish 🎉' : 'Next →'}
+                </button>
+                <button style={{ border: 'none', background: 'transparent', color: MUT, fontSize: 10.5, cursor: 'pointer', fontFamily: MONO, padding: 0 }} onClick={advanceTut}>skip</button>
+              </div>
+            </div>
+          )}
+
           {/* short circuit banner */}
           {res && res.short && (
-            <div style={{ position: 'absolute', top: 8, left: 8, maxWidth: '58%', zIndex: 6, background: '#fdeae7', border: '1.5px solid ' + REDC, color: '#8c2f26', borderRadius: 10, padding: '6px 11px', fontSize: 11.5, boxShadow: '0 3px 10px rgba(140,47,38,0.15)' }}>
+            <div style={{ position: 'absolute', ...(tutDef ? { bottom: 62, left: 8 } : { top: 8, left: 8 }), maxWidth: '58%', zIndex: 6, background: '#fdeae7', border: '1.5px solid ' + REDC, color: '#8c2f26', borderRadius: 10, padding: '6px 11px', fontSize: 11.5, boxShadow: '0 3px 10px rgba(140,47,38,0.15)' }}>
               ⚡ Short circuit — add a resistor in the loop
             </div>
           )}
